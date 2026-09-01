@@ -116,7 +116,8 @@ def send_telegram(text: str):
 
 # ---------------------------- ODDS API ----------------------------
 SPORT_GROUPS_WANTED = {"Soccer", "Tennis", "Horse Racing"}
-MAX_LEAGUES_PER_SCAN = 12  # caps requests so we don't blow the free monthly quota
+MAX_LEAGUES_PER_SCAN = 6  # caps requests so we don't blow the free monthly quota
+# (each league can cost up to 2 requests now due to market-fallback retries)
 
 
 def get_active_sport_keys():
@@ -157,28 +158,43 @@ def get_inplay_odds():
     all_events = []
     for sport_key in sport_keys:
         url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
-        params = {
+        base_params = {
             "apiKey": ODDS_API_KEY,
             "regions": "us,uk,eu",
-            # h2h = moneyline, double_chance = 1X/X2/12, btts = both teams to
-            # score, totals = over/under goals
-            "markets": "h2h,double_chance,btts,totals",
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            events = r.json()
+        # Try the full market bundle first. Some leagues don't support all
+        # of these markets (btts/double_chance especially) and the API
+        # rejects the WHOLE request with a 422 if even one market isn't
+        # offered - so fall back to moneyline-only for that league instead
+        # of losing it entirely.
+        market_attempts = ["h2h,double_chance,btts,totals", "h2h"]
+        events = None
+        for markets_str in market_attempts:
+            params = dict(base_params, markets=markets_str)
+            try:
+                r = requests.get(url, params=params, timeout=20)
+                r.raise_for_status()
+                events = r.json()
+                remaining = r.headers.get("x-requests-remaining")
+                if remaining:
+                    log.info(f"[{sport_key}] requests remaining this period: {remaining}")
+                break
+            except requests.exceptions.HTTPError as e:
+                if r.status_code == 422 and markets_str != market_attempts[-1]:
+                    log.warning(f"[{sport_key}] markets '{markets_str}' not supported, retrying with fewer markets")
+                    continue
+                log.error(f"Odds fetch failed for {sport_key}: {e}")
+                break
+            except Exception as e:
+                log.error(f"Odds fetch failed for {sport_key}: {e}")
+                break
+
+        if events:
             for e in events:
                 e["sport_key"] = sport_key
             all_events.extend(events)
-            remaining = r.headers.get("x-requests-remaining")
-            if remaining:
-                log.info(f"[{sport_key}] requests remaining this period: {remaining}")
-        except Exception as e:
-            log.error(f"Odds fetch failed for {sport_key}: {e}")
-            continue
 
     return all_events
 
