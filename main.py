@@ -160,7 +160,7 @@ def get_inplay_odds():
         url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
         base_params = {
             "apiKey": ODDS_API_KEY,
-            "regions": "us,uk,eu",
+            "regions": "uk,eu",  # dropped 'us' - American books rarely offer btts/double_chance, which was causing every request to fail and fall back to moneyline-only
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }
