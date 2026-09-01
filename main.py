@@ -144,9 +144,12 @@ def get_active_sport_keys():
 
 def get_inplay_odds():
     """
-    Fetch live in-play odds across active soccer, tennis, and horse racing
-    leagues. One request to list active leagues, then one request per league
-    (capped at MAX_LEAGUES_PER_SCAN) to stay inside the free monthly quota.
+    Fetch LIVE in-play odds across active soccer, tennis, and horse racing
+    leagues, across multiple markets (moneyline, double chance, BTTS,
+    over/under). One request to list active leagues, then one request per
+    league (capped at MAX_LEAGUES_PER_SCAN) to stay inside the free
+    monthly quota. Live/finished-game filtering happens later via
+    passes_sanity_check (API-FOOTBALL for soccer, time-based for others).
     """
     sport_keys = get_active_sport_keys()
     log.info(f"Active leagues this scan: {sport_keys}")
@@ -157,7 +160,9 @@ def get_inplay_odds():
         params = {
             "apiKey": ODDS_API_KEY,
             "regions": "us,uk,eu",
-            "markets": "h2h",  # match/match-winner market for all three sport types
+            # h2h = moneyline, double_chance = 1X/X2/12, btts = both teams to
+            # score, totals = over/under goals
+            "markets": "h2h,double_chance,btts,totals",
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }
@@ -180,11 +185,18 @@ def get_inplay_odds():
 
 def find_value_bets(events):
     """
-    For each event, for each outcome, compare the BEST available price against
-    the de-vigged consensus probability from all other books. If the best
-    price implies meaningfully lower probability than consensus, that's edge.
+    For each event, for each market (moneyline, spreads, totals) and each
+    outcome, compare the BEST available price against the de-vigged
+    consensus probability from all other books. If the best price implies
+    meaningfully lower probability than consensus, that's edge.
     """
     value_bets = []
+    MARKET_LABELS = {
+        "h2h": "Moneyline (1X2)",
+        "double_chance": "Double Chance",
+        "btts": "Both Teams to Score",
+        "totals": "Over/Under Goals",
+    }
 
     for event in events:
         bookmakers = event.get("bookmakers", [])
@@ -195,80 +207,85 @@ def find_value_bets(events):
         away = event.get("away_team")
         match_name = f"{home} vs {away}"
 
-        # Collect all prices per outcome across books
-        outcome_prices = {}  # outcome_name -> list of (book_title, price)
-        for bm in bookmakers:
-            for market in bm.get("markets", []):
-                if market["key"] != "h2h":
+        for market_key, market_label in MARKET_LABELS.items():
+            # outcome_key = (outcome name, point) so "Over 2.5" != "Over 3.5"
+            outcome_prices = {}  # outcome_key -> list of (book_title, price)
+            for bm in bookmakers:
+                for market in bm.get("markets", []):
+                    if market["key"] != market_key:
+                        continue
+                    for outcome in market["outcomes"]:
+                        outcome_key = (outcome["name"], outcome.get("point"))
+                        outcome_prices.setdefault(outcome_key, []).append(
+                            (bm["title"], outcome["price"])
+                        )
+
+            if len(outcome_prices) < 2:
+                continue
+
+            # De-vig: convert each book's full market to implied probs summing
+            # to 1, then average across books to get fair consensus per outcome
+            consensus_probs = {k: [] for k in outcome_prices}
+            for bm in bookmakers:
+                for market in bm.get("markets", []):
+                    if market["key"] != market_key:
+                        continue
+                    outcomes = market["outcomes"]
+                    implied = [1 / o["price"] for o in outcomes]
+                    overround = sum(implied)
+                    if overround == 0:
+                        continue
+                    for o, imp in zip(outcomes, implied):
+                        fair_prob = imp / overround  # removes the vig
+                        o_key = (o["name"], o.get("point"))
+                        if o_key in consensus_probs:
+                            consensus_probs[o_key].append(fair_prob)
+
+            for outcome_key, prices in outcome_prices.items():
+                outcome_name, point = outcome_key
+                probs = consensus_probs.get(outcome_key, [])
+                if not probs:
                     continue
-                for outcome in market["outcomes"]:
-                    outcome_prices.setdefault(outcome["name"], []).append(
-                        (bm["title"], outcome["price"])
+                avg_consensus_prob = sum(probs) / len(probs)
+
+                # If a specific bookmaker is required (e.g. Melbet), only use
+                # that book's price for this outcome - skip if not quoted
+                if REQUIRED_BOOK:
+                    book_prices = [(b, p) for b, p in prices if REQUIRED_BOOK in b.lower()]
+                    if not book_prices:
+                        continue
+                    best_book, best_price = max(book_prices, key=lambda x: x[1])
+                else:
+                    best_book, best_price = max(prices, key=lambda x: x[1])
+
+                # Odds range filter - skip longshots and near-certainties
+                if not (MIN_ODDS <= best_price <= MAX_ODDS):
+                    continue
+
+                # Minimum confidence filter - only "safe-ish" picks
+                if avg_consensus_prob * 100 < MIN_CONSENSUS_PROB_PERCENT:
+                    continue
+
+                implied_prob_best = 1 / best_price
+
+                # Edge = how much cheaper the best price is vs fair consensus
+                edge_percent = (avg_consensus_prob - implied_prob_best) * 100
+
+                if edge_percent >= MIN_EDGE_PERCENT:
+                    outcome_label = f"{outcome_name} {point}" if point is not None else outcome_name
+                    value_bets.append(
+                        {
+                            "match": match_name,
+                            "market": market_label,
+                            "outcome": outcome_label,
+                            "best_book": best_book,
+                            "best_odds": best_price,
+                            "consensus_prob": round(avg_consensus_prob * 100, 1),
+                            "edge_percent": round(edge_percent, 1),
+                            "sport_key": event.get("sport_key"),
+                            "commence_time": event.get("commence_time"),
+                        }
                     )
-
-        if len(outcome_prices) < 2:
-            continue
-
-        # De-vig: convert each book's full market to implied probs summing to 1,
-        # then average across books to get a fair consensus probability per outcome
-        consensus_probs = {name: [] for name in outcome_prices}
-        for bm in bookmakers:
-            for market in bm.get("markets", []):
-                if market["key"] != "h2h":
-                    continue
-                outcomes = market["outcomes"]
-                implied = [1 / o["price"] for o in outcomes]
-                overround = sum(implied)
-                if overround == 0:
-                    continue
-                for o, imp in zip(outcomes, implied):
-                    fair_prob = imp / overround  # removes the vig
-                    consensus_probs[o["name"]].append(fair_prob)
-
-        for outcome_name, prices in outcome_prices.items():
-            probs = consensus_probs.get(outcome_name, [])
-            if not probs:
-                continue
-            avg_consensus_prob = sum(probs) / len(probs)
-
-            # If a specific bookmaker is required (e.g. Melbet), only consider
-            # that book's price for this outcome - skip if it didn't quote it
-            if REQUIRED_BOOK:
-                book_prices = [(b, p) for b, p in prices if REQUIRED_BOOK in b.lower()]
-                if not book_prices:
-                    continue
-                best_book, best_price = max(book_prices, key=lambda x: x[1])
-            else:
-                # best (highest) price available for this outcome
-                best_book, best_price = max(prices, key=lambda x: x[1])
-
-            # Odds range filter - skip longshots and near-certainties
-            if not (MIN_ODDS <= best_price <= MAX_ODDS):
-                continue
-
-            # Minimum confidence filter - only "safe-ish" picks
-            if avg_consensus_prob * 100 < MIN_CONSENSUS_PROB_PERCENT:
-                continue
-
-            implied_prob_best = 1 / best_price
-
-            # Edge = how much cheaper the best price is vs fair consensus
-            edge_percent = (avg_consensus_prob - implied_prob_best) * 100
-
-            if edge_percent >= MIN_EDGE_PERCENT:
-                value_bets.append(
-                    {
-                        "match": match_name,
-                        "market": "Match/Event Winner",
-                        "outcome": outcome_name,
-                        "best_book": best_book,
-                        "best_odds": best_price,
-                        "consensus_prob": round(avg_consensus_prob * 100, 1),
-                        "edge_percent": round(edge_percent, 1),
-                        "sport_key": event.get("sport_key"),
-                        "commence_time": event.get("commence_time"),
-                    }
-                )
 
     return value_bets
 
@@ -318,15 +335,29 @@ FINISHED_STATUSES = {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO", "PST"}
 def passes_sanity_check(value_bet, stats_lookup):
     """
     Skip alerts for matches that:
-    - have already finished/were abandoned/etc (FINISHED_STATUSES)
+    - have already finished/were abandoned/etc (FINISHED_STATUSES) - soccer only,
+      via API-FOOTBALL
     - the-odds-api still lists as an "event" but API-FOOTBALL has no live
-      record for at all (couldn't confirm it's actually in-play) - for
-      soccer specifically, since that's the only sport with a stats source
-    - are in the noisy last ~5 minutes of a half
-    Only applies to soccer, since API-FOOTBALL only covers soccer. Tennis
-    and horse racing bets always pass (no live-stats source available).
+      record for at all (couldn't confirm it's actually in-play) - soccer only
+    - are in the noisy last ~5 minutes of a half - soccer only
+    - for tennis/horse racing (no live-stats source available), started
+      long enough ago that it's essentially certain to be over already
     """
-    if value_bet.get("sport_key", "").split("_")[0] != "soccer":
+    sport = value_bet.get("sport_key", "").split("_")[0]
+
+    if sport != "soccer":
+        # No live-stats source for tennis/horse racing - fall back to a
+        # simple time-based check using the event's scheduled start time
+        commence_time = value_bet.get("commence_time")
+        if commence_time:
+            try:
+                start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+                elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+                max_hours = 1 if sport == "horseracing" or "horse" in sport else 4
+                if elapsed_hours > max_hours:
+                    return False, None, None  # started too long ago, almost certainly finished
+            except Exception:
+                pass
         return True, None, None
 
     if not stats_lookup:
