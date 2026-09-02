@@ -119,11 +119,17 @@ SPORT_GROUPS_WANTED = {"Soccer", "Tennis", "Horse Racing"}
 MAX_LEAGUES_PER_SCAN = 3  # lowered further - quota is nearly exhausted this period
 
 
-def get_active_sport_keys():
+def get_active_sport_keys(offset: int = 0):
     """
     Ask the-odds-api which leagues/tours are currently active for the sports
     we care about (soccer, tennis, horse racing), so we don't hardcode a
     stale list of league keys. Costs 1 request.
+
+    Returns a ROTATING slice of MAX_LEAGUES_PER_SCAN leagues starting at
+    `offset`, wrapping around the full list - so successive scans cover
+    different leagues instead of always hitting the same first few
+    (which used to always be Argentina/Austria/Belgium/etc, alphabetically
+    early in the list).
     """
     url = f"{ODDS_API_BASE}/sports"
     params = {"apiKey": ODDS_API_KEY}
@@ -139,10 +145,18 @@ def get_active_sport_keys():
         s["key"] for s in all_sports
         if s.get("group") in SPORT_GROUPS_WANTED and s.get("active")
     ]
-    return active[:MAX_LEAGUES_PER_SCAN]
+
+    if not active:
+        return []
+
+    n = len(active)
+    start = offset % n
+    # wrap-around slice of MAX_LEAGUES_PER_SCAN leagues starting at `start`
+    rotated = [active[(start + i) % n] for i in range(min(MAX_LEAGUES_PER_SCAN, n))]
+    return rotated
 
 
-def get_inplay_odds():
+def get_inplay_odds(league_offset: int = 0):
     """
     Fetch LIVE in-play odds across active soccer, tennis, and horse racing
     leagues. Only requests FEATURED markets (h2h, totals) here - these are
@@ -150,8 +164,12 @@ def get_inplay_odds():
     BTTS and Double Chance require a separate per-match call (see
     get_extra_markets_for_event below) and are only fetched later for
     matches that already look promising, to protect your free quota.
+
+    `league_offset` rotates which batch of leagues gets scanned this cycle
+    (see get_active_sport_keys) so coverage isn't stuck on the same few
+    leagues every time.
     """
-    sport_keys = get_active_sport_keys()
+    sport_keys = get_active_sport_keys(offset=league_offset)
     log.info(f"Active leagues this scan: {sport_keys}")
 
     all_events = []
@@ -452,10 +470,10 @@ def format_alert(vb, minute, score):
     )
 
 
-def run_scan_and_count():
+def run_scan_and_count(league_offset: int = 0):
     """Runs one scan cycle, returns the number of alerts actually sent."""
     log.info("Starting scan...")
-    events = get_inplay_odds()
+    events = get_inplay_odds(league_offset=league_offset)
     log.info(f"Fetched {len(events)} in-play events")
 
     if not events:
@@ -544,15 +562,17 @@ def main():
     alerts_since_summary = 0
     last_summary_time = time.time()
     SUMMARY_INTERVAL_SECONDS = 24 * 60 * 60  # once a day
+    league_offset = 0  # rotates forward each scan so we cover different leagues over time
 
     while True:
         try:
-            alerts_sent_this_scan = run_scan_and_count()
+            alerts_sent_this_scan = run_scan_and_count(league_offset=league_offset)
             alerts_since_summary += alerts_sent_this_scan
         except Exception as e:
             log.error(f"Scan failed: {e}")
             alerts_sent_this_scan = 0
 
+        league_offset += MAX_LEAGUES_PER_SCAN  # move to the next batch of leagues next scan
         scans_since_summary += 1
 
         if time.time() - last_summary_time >= SUMMARY_INTERVAL_SECONDS:
