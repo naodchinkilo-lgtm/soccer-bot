@@ -116,8 +116,7 @@ def send_telegram(text: str):
 
 # ---------------------------- ODDS API ----------------------------
 SPORT_GROUPS_WANTED = {"Soccer", "Tennis", "Horse Racing"}
-MAX_LEAGUES_PER_SCAN = 6  # caps requests so we don't blow the free monthly quota
-# (each league can cost up to 2 requests now due to market-fallback retries)
+MAX_LEAGUES_PER_SCAN = 3  # lowered further - quota is nearly exhausted this period
 
 
 def get_active_sport_keys():
