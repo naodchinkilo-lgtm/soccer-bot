@@ -146,11 +146,11 @@ def get_active_sport_keys():
 def get_inplay_odds():
     """
     Fetch LIVE in-play odds across active soccer, tennis, and horse racing
-    leagues, across multiple markets (moneyline, double chance, BTTS,
-    over/under). One request to list active leagues, then one request per
-    league (capped at MAX_LEAGUES_PER_SCAN) to stay inside the free
-    monthly quota. Live/finished-game filtering happens later via
-    passes_sanity_check (API-FOOTBALL for soccer, time-based for others).
+    leagues. Only requests FEATURED markets (h2h, totals) here - these are
+    the only markets the-odds-api's bulk "all events" endpoint supports.
+    BTTS and Double Chance require a separate per-match call (see
+    get_extra_markets_for_event below) and are only fetched later for
+    matches that already look promising, to protect your free quota.
     """
     sport_keys = get_active_sport_keys()
     log.info(f"Active leagues this scan: {sport_keys}")
@@ -158,45 +158,66 @@ def get_inplay_odds():
     all_events = []
     for sport_key in sport_keys:
         url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
-        base_params = {
+        params = {
             "apiKey": ODDS_API_KEY,
-            "regions": "uk,eu",  # dropped 'us' - American books rarely offer btts/double_chance, which was causing every request to fail and fall back to moneyline-only
+            "regions": "uk,eu",
+            "markets": "h2h,totals",  # featured markets only - the bulk endpoint doesn't support btts/double_chance
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }
-        # Try the full market bundle first. Some leagues don't support all
-        # of these markets (btts/double_chance especially) and the API
-        # rejects the WHOLE request with a 422 if even one market isn't
-        # offered - so fall back to moneyline-only for that league instead
-        # of losing it entirely.
-        market_attempts = ["h2h,double_chance,btts,totals", "h2h"]
-        events = None
-        for markets_str in market_attempts:
-            params = dict(base_params, markets=markets_str)
-            try:
-                r = requests.get(url, params=params, timeout=20)
-                r.raise_for_status()
-                events = r.json()
-                remaining = r.headers.get("x-requests-remaining")
-                if remaining:
-                    log.info(f"[{sport_key}] requests remaining this period: {remaining}")
-                break
-            except requests.exceptions.HTTPError as e:
-                if r.status_code == 422 and markets_str != market_attempts[-1]:
-                    log.warning(f"[{sport_key}] markets '{markets_str}' not supported, retrying with fewer markets")
-                    continue
-                log.error(f"Odds fetch failed for {sport_key}: {e}")
-                break
-            except Exception as e:
-                log.error(f"Odds fetch failed for {sport_key}: {e}")
-                break
-
-        if events:
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            events = r.json()
             for e in events:
                 e["sport_key"] = sport_key
             all_events.extend(events)
+            remaining = r.headers.get("x-requests-remaining")
+            if remaining:
+                log.info(f"[{sport_key}] requests remaining this period: {remaining}")
+        except Exception as e:
+            log.error(f"Odds fetch failed for {sport_key}: {e}")
+            continue
 
     return all_events
+
+
+def get_extra_markets_for_event(sport_key, event_id):
+    """
+    Fetch BTTS and Double Chance odds for ONE specific match. This costs a
+    separate API request, so it's only called for matches that already
+    passed the moneyline/totals value-bet check - not for every match in
+    the scan, to avoid burning the free monthly quota.
+    """
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/events/{event_id}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "uk,eu",
+        "markets": "btts,double_chance",
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"Extra markets fetch failed for event {event_id}: {e}")
+        return None
+
+
+def merge_extra_markets(event, extra_data):
+    """Merges btts/double_chance markets (from a per-event call) into an
+    event's existing bookmakers list, matching by bookmaker key."""
+    if not extra_data:
+        return event
+    existing_by_key = {bm["key"]: bm for bm in event.get("bookmakers", [])}
+    for bm in extra_data.get("bookmakers", []):
+        if bm["key"] in existing_by_key:
+            existing_by_key[bm["key"]]["markets"].extend(bm.get("markets", []))
+        else:
+            event.setdefault("bookmakers", []).append(bm)
+    return event
 
 
 def find_value_bets(events):
@@ -441,8 +462,47 @@ def run_scan_and_count():
     if not events:
         return 0
 
+    # Stage 1: cheap bulk check on featured markets (moneyline, totals)
     value_bets = find_value_bets(events)
-    log.info(f"Found {len(value_bets)} candidate value bets before stats filter")
+    log.info(f"Found {len(value_bets)} candidate value bets on featured markets (moneyline/totals)")
+
+    # Stage 2: for matches that already showed value, spend one extra request
+    # per match to also check BTTS and Double Chance - not done for every
+    # match, to protect the free monthly quota
+    candidate_event_ids = {}
+    for event in events:
+        if event.get("id") in {vb.get("event_id") for vb in value_bets}:
+            continue  # already tagged below; placeholder, see loop below
+    # tag event_id onto each value bet + build lookup of events by id
+    events_by_id = {e.get("id"): e for e in events}
+    candidate_ids = set()
+    for vb in value_bets:
+        pass  # event_id not tracked yet at this stage - see below
+
+    # Build the set of events worth the extra BTTS/Double Chance lookup:
+    # any event that already produced a moneyline/totals value bet
+    matched_event_ids = set()
+    for event in events:
+        eid = event.get("id")
+        home, away = event.get("home_team"), event.get("away_team")
+        match_name = f"{home} vs {away}"
+        if any(vb["match"] == match_name for vb in value_bets):
+            matched_event_ids.add(eid)
+
+    for eid in matched_event_ids:
+        event = events_by_id.get(eid)
+        if not event:
+            continue
+        extra = get_extra_markets_for_event(event["sport_key"], eid)
+        merged_event = merge_extra_markets(event, extra)
+        extra_bets = find_value_bets([merged_event])
+        # only keep the newly-found btts/double_chance ones (avoid re-adding
+        # the same moneyline/totals bet twice)
+        for eb in extra_bets:
+            if eb["market"] in ("Both Teams to Score", "Double Chance"):
+                value_bets.append(eb)
+
+    log.info(f"Found {len(value_bets)} total candidate value bets after BTTS/Double Chance check")
 
     stats_lookup = get_live_stats_lookup()
 
